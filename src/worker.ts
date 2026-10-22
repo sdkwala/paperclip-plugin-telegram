@@ -15,6 +15,8 @@ import {
   setMyCommands,
   escapeMarkdownV2,
   isForum,
+  getMe,
+  getChat,
   GENERAL_TOPIC_THREAD_ID,
 } from "./telegram-api.js";
 import {
@@ -54,6 +56,7 @@ import { EscalationManager } from "./escalation.js";
 import type { EscalationEvent } from "./escalation.js";
 import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
 import { normalizeSecretRef, validateSecretRefFields } from "./secret-ref-validation.js";
+import { parseHttpOrigin, validateTelegramOriginUrls } from "./origin-guard.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
 import { isWorking } from "./agent-status.js";
 import { buildPaperclipAuthHeaders, fetchPaperclipApi } from "./paperclip-api.js";
@@ -239,6 +242,171 @@ function normalizeBoardAccessState(value: unknown): TelegramBoardAccessState {
 
 async function loadBoardAccessState(ctx: PluginContext): Promise<TelegramBoardAccessState> {
   return normalizeBoardAccessState(await ctx.state.get(BOARD_ACCESS_SCOPE));
+}
+
+export type TestConfigActionParams = {
+  companyId?: string;
+  telegramBotTokenRef?: unknown;
+  paperclipBaseUrl?: unknown;
+  probeChatIds?: unknown;
+};
+
+export type TestConfigActionResult = {
+  ok: boolean;
+  stage: "secret" | "telegram" | "paperclip" | "complete";
+  error?: string;
+  bot?: { id: number; username?: string; firstName?: string };
+  chats?: Array<{ chatId: string; ok: boolean; error?: string }>;
+  paperclip?: { ok: boolean; status?: string; version?: string; error?: string };
+  checkedAt?: string;
+};
+
+/**
+ * Probe the configured Paperclip host with anonymous GET /api/health — the
+ * same check `paperclipai plugin target` performs — so a wrong or unreachable
+ * API URL is caught by Test configuration with an actionable message.
+ *
+ * Loopback base URLs bypass ctx.http because the governed egress gate blocks
+ * localhost targets (the same carve-out fetchPaperclipApi uses).
+ */
+async function probePaperclipHost(
+  baseUrl: string,
+  governedFetch: (input: string, init?: RequestInit) => Promise<Response>,
+): Promise<NonNullable<TestConfigActionResult["paperclip"]>> {
+  const parsed = parseHttpOrigin(baseUrl);
+  if (!parsed) {
+    return { ok: false, error: "paperclipBaseUrl is not a valid http(s) URL." };
+  }
+
+  try {
+    const url = `${parsed.origin}/api/health`;
+    const response = isLoopbackHostname(parsed.hostname)
+      ? await fetch(url, { method: "GET" })
+      : await governedFetch(url, { method: "GET" });
+
+    const text = await response.text();
+    let payload: { status?: unknown; version?: unknown } | null = null;
+    try {
+      payload = JSON.parse(text.trim()) as { status?: unknown; version?: unknown };
+    } catch {
+      return {
+        ok: false,
+        error: `${parsed.origin} did not answer /api/health with JSON — is that really the Paperclip API host?`,
+      };
+    }
+
+    if (typeof payload?.status !== "string") {
+      return { ok: false, error: `${parsed.origin} answered but not with a Paperclip health payload.` };
+    }
+
+    return {
+      ok: true,
+      status: payload.status,
+      version: typeof payload.version === "string" ? payload.version : undefined,
+    };
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      error: `Paperclip API URL ${parsed.origin} did not respond: ${detail}. Verify the host before saving — approval buttons and links break with the wrong origin.`,
+    };
+  }
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return ["localhost", "127.0.0.1", "[::1]", "0.0.0.0"].includes(hostname);
+}
+
+async function runTestConfigAction(
+  ctx: PluginContext,
+  record: Record<string, unknown>,
+): Promise<TestConfigActionResult> {
+  const companyId = asNonEmptyString(record.companyId);
+  if (!companyId) {
+    return {
+      ok: false,
+      stage: "secret",
+      error: "Open this settings page inside a company; the bot token secret is company-scoped.",
+    };
+  }
+
+  const rawTokenRef = record.telegramBotTokenRef;
+  const refShapeErrors = validateSecretRefFields({ telegramBotTokenRef: rawTokenRef });
+  if (refShapeErrors.length > 0) {
+    return {
+      ok: false,
+      stage: "secret",
+      error: `Bad telegramBotTokenRef. ${refShapeErrors[0]}`,
+    };
+  }
+
+  const normalizedRef = normalizeSecretRef(rawTokenRef);
+  if (!normalizedRef) {
+    return {
+      ok: false,
+      stage: "secret",
+      error: "telegramBotTokenRef is not a usable secret reference.",
+    };
+  }
+
+  let token: string;
+  try {
+    token = await ctx.secrets.resolve(normalizedRef as string, {
+      companyId,
+      configPath: "telegramBotTokenRef",
+    });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      stage: "secret",
+      error: `Could not resolve the bot token secret for this company. Create or rotate the secret, then select it again in this settings page. (${detail})`,
+    };
+  }
+
+  const identityProbe = await getMe(ctx, token);
+  if (!identityProbe.ok) {
+    return { ok: false, stage: "telegram", error: identityProbe.error };
+  }
+  if (!identityProbe.bot) {
+    return { ok: false, stage: "telegram", error: "getMe returned no bot identity." };
+  }
+
+  const chats: NonNullable<TestConfigActionResult["chats"]> = [];
+
+  const chatIds = Array.isArray(record.probeChatIds)
+    ? record.probeChatIds.filter(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      )
+    : [];
+  for (const chatId of new Set(chatIds.map((id) => id.trim()))) {
+    const probe = await getChat(ctx, token, chatId);
+    chats.push(probe.ok ? { chatId, ok: true } : { chatId, ok: false, error: probe.error });
+  }
+
+  const baseUrlInput =
+    asNonEmptyString(record.paperclipBaseUrl) ?? String(DEFAULT_CONFIG.paperclipBaseUrl);
+  const paperclipProbe = await probePaperclipHost(baseUrlInput, ctx.http.fetch);
+  if (!paperclipProbe.ok) {
+    return {
+      ok: false,
+      stage: "paperclip",
+      error: paperclipProbe.error,
+      bot: identityProbe.bot,
+      chats,
+      paperclip: paperclipProbe,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  return {
+    ok: true,
+    stage: "complete",
+    bot: identityProbe.bot,
+    chats,
+    paperclip: paperclipProbe,
+    checkedAt: new Date().toISOString(),
+  };
 }
 
 async function persistBoardAccessState(
@@ -841,6 +1009,14 @@ export const plugin = definePlugin({
       });
     });
 
+    // PUP-89 M1 "Test configuration": verify the candidate bot token against
+    // Telegram getMe and probe chat reachability / Paperclip host liveness.
+    // The settings UI calls this after the host's validateConfig check, so the
+    // action only covers the parts that need secrets and outbound network.
+    ctx.actions.register("test-config", async (params) => {
+      return runTestConfigAction(ctx, isRecord(params) ? params : {});
+    });
+
     ctx.events.on("plugin.stopping", async () => {
       pollingActive = false;
     });
@@ -1422,6 +1598,10 @@ export const plugin = definePlugin({
     const secretRefErrors = validateSecretRefFields(config);
     if (secretRefErrors.length > 0) {
       return { ok: false, errors: secretRefErrors };
+    }
+    const originErrors = validateTelegramOriginUrls(config as Record<string, unknown>);
+    if (originErrors.length > 0) {
+      return { ok: false, errors: originErrors };
     }
     const allowlistErrors = validateTelegramAllowlists(config);
     if (allowlistErrors.length > 0) {

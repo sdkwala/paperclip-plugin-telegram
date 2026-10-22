@@ -221,6 +221,101 @@ export async function isForum(
 /** General topic thread ID for forum groups. */
 export const GENERAL_TOPIC_THREAD_ID = 1;
 
+export type TelegramBotIdentity = {
+  id: number;
+  username?: string;
+  firstName?: string;
+};
+
+export type TelegramApiProbeResult =
+  | { ok: true; bot?: TelegramBotIdentity; chatId?: string }
+  | { ok: false; error: string };
+
+/**
+ * Verify a bot token against Telegram `getMe` and return its identity.
+ * Used by the settings "Test configuration" action: a token saved as a secret
+ * ref must still be valid/revoked-free before the board relies on the bot.
+ */
+export async function getMe(ctx: PluginContext, token: string): Promise<TelegramApiProbeResult> {
+  try {
+    const res = await ctx.http.fetch(`${TELEGRAM_API}/bot${token}/getMe`, { method: "GET" });
+    const data = (await res.json()) as {
+      ok: boolean;
+      result?: { id: number; username?: string; first_name?: string };
+      description?: string;
+      error_code?: number;
+    };
+
+    if (!data.ok) {
+      return {
+        ok: false,
+        error: describeTelegramProbeResponse("getMe", data.description, data.error_code),
+      };
+    }
+
+    const me = data.result;
+    if (!me || typeof me.id !== "number") {
+      return { ok: false, error: "getMe returned no bot identity." };
+    }
+
+    return {
+      ok: true,
+      bot: {
+        id: me.id,
+        username: typeof me.username === "string" ? me.username : undefined,
+        firstName: typeof me.first_name === "string" ? me.first_name : undefined,
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: `getMe request failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+/**
+ * Reachability probe for a configured chat: the bot must be able to read the
+ * chat (`getChat`), which fails when the bot is not in the chat or the ID is
+ * wrong. Used by the settings "Test configuration" action.
+ */
+export async function getChat(
+  ctx: PluginContext,
+  token: string,
+  chatId: string,
+): Promise<TelegramApiProbeResult> {
+  try {
+    const res = await ctx.http.fetch(`${TELEGRAM_API}/bot${token}/getChat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId }),
+    });
+    const data = (await res.json()) as {
+      ok: boolean;
+      description?: string;
+      error_code?: number;
+    };
+
+    if (!data.ok) {
+      return {
+        ok: false,
+        error: describeTelegramProbeResponse(`chat ${chatId}`, data.description, data.error_code),
+      };
+    }
+
+    return { ok: true, chatId };
+  } catch (err) {
+    return { ok: false, error: `getChat request failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+function describeTelegramProbeResponse(probe: string, description?: string, errorCode?: number): string {
+  const detail = (description ?? "").trim();
+  if (errorCode === 401) {
+    return `Telegram rejected the bot token (${probe}${detail ? `: ${detail}` : ""}); create/rotate the BotFather token and update the secret.`;
+  }
+  return detail
+    ? `${probe}: ${detail}`
+    : `${probe}: unknown Telegram error.`;
+}
+
 // MarkdownV2 requires escaping these characters
 const MD_ESCAPE_CHARS = /([_*\[\]()~`>#+\-=|{}.!\\])/g;
 

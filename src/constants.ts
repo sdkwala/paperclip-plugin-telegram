@@ -19,12 +19,19 @@ export const DEFAULT_CONFIG = {
   notifyOnIssueAssigned: false,
   onlyNotifyIfAssignedTo: "",
   notifyOnApprovalCreated: true,
-  onlyNotifyBoardApprovals: false,
+  // M1 default: only true board gates ring a phone; internal approval chains
+  // stay inside Paperclip.
+  onlyNotifyBoardApprovals: true,
   notifyOnAgentError: true,
+  // M1 defaults: agent-run start/finish lifecycle notifications stay off
+  // (noise). Turn on explicitly per company once M1 is stable.
   notifyOnAgentRunStarted: false,
   notifyOnAgentRunFinished: false,
-  enableCommands: true,
-  enableInbound: true,
+  // M1 defaults: inbound/commands start disabled and cannot be enabled until
+  // at least one Telegram user/chat allowlist entry exists (empty-unlocked
+  // bots are rejected by the host config policy).
+  enableCommands: false,
+  enableInbound: false,
   allowedTelegramUserIds: [] as string[],
   allowedTelegramChatIds: [] as string[],
   digestMode: "off" as "off" | "daily" | "bidaily" | "tridaily",
