@@ -262,6 +262,38 @@ function asStringArray(value: unknown): string[] {
     : [];
 }
 
+/**
+ * Current hosts validate plugin config against a secret-ref rule that only
+ * accepts `{ type: "secret_ref", secretId, version? }` — a bare UUID string
+ * throws an unprocessable error. The settings UI keeps bare UUID strings in
+ * its field state (easier to read/edit) and serializes to the object shape on
+ * the way out, while parsing object refs back into bare UUIDs on the way in.
+ */
+function refDisplayId(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (value !== null && typeof value === "object") {
+    const record = value as { type?: unknown; secretId?: unknown };
+    if (record.type === "secret_ref" && typeof record.secretId === "string") {
+      return record.secretId.trim();
+    }
+  }
+  return "";
+}
+
+function secretRefForSave(value: string): string | { type: "secret_ref"; secretId: string } {
+  const trimmed = value.trim();
+  return trimmed ? { type: "secret_ref", secretId: trimmed } : "";
+}
+
+function serializePluginSecretRefs(config: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...config,
+    telegramBotTokenRef: secretRefForSave(refDisplayId(config.telegramBotTokenRef)),
+    paperclipBoardApiTokenRef: secretRefForSave(refDisplayId(config.paperclipBoardApiTokenRef)),
+    transcriptionApiKeyRef: secretRefForSave(refDisplayId(config.transcriptionApiKeyRef)),
+  };
+}
+
 function asDigestMode(value: unknown): TelegramRoutingConfig["digestMode"] {
   return value === "daily" || value === "bidaily" || value === "tridaily" ? value : "off";
 }
@@ -323,7 +355,7 @@ function extractRoutingConfig(config: Record<string, unknown>): TelegramRoutingC
 
 function extractConnectionConfig(config: Record<string, unknown>): TelegramConnectionConfig {
   return {
-    telegramBotTokenRef: asString(config.telegramBotTokenRef),
+    telegramBotTokenRef: refDisplayId(config.telegramBotTokenRef),
     // Deployment-specific default: the same origin this Paperclip browser
     // session is served from, instead of a hardcoded localhost URL.
     paperclipBaseUrl:
@@ -334,7 +366,7 @@ function extractConnectionConfig(config: Record<string, unknown>): TelegramConne
 
 function extractBoardConfig(config: Record<string, unknown>): TelegramBoardConfig {
   return {
-    paperclipBoardApiTokenRef: asString(config.paperclipBoardApiTokenRef),
+    paperclipBoardApiTokenRef: refDisplayId(config.paperclipBoardApiTokenRef),
   };
 }
 
@@ -349,7 +381,7 @@ function extractAccessConfig(config: Record<string, unknown>): TelegramAccessCon
 
 function extractMediaConfig(config: Record<string, unknown>): TelegramMediaConfig {
   return {
-    transcriptionApiKeyRef: asString(config.transcriptionApiKeyRef),
+    transcriptionApiKeyRef: refDisplayId(config.transcriptionApiKeyRef),
     briefAgentId: asString(config.briefAgentId),
     briefAgentChatIds: asStringArray(config.briefAgentChatIds),
   };
@@ -799,6 +831,14 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
   const allowlistsEmpty =
     accessConfig.allowedTelegramUserIds.length === 0 && accessConfig.allowedTelegramChatIds.length === 0;
   const accessAllowlistBlock = inboundActive && allowlistsEmpty;
+  const anySectionLoading =
+    connectionLoading ||
+    accessLoading ||
+    routingLoading ||
+    boardConfigLoading ||
+    mediaLoading ||
+    escalationLoading ||
+    proactiveLoading;
 
   useEffect(() => {
     let cancelled = false;
@@ -1099,7 +1139,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setBoardConfigMessage(null);
     try {
       const currentConfig = await fetchPluginConfig(companyId);
-      const nextConfig = { ...currentConfig, ...boardConfig };
+      const nextConfig = serializePluginSecretRefs({ ...currentConfig, ...boardConfig });
       await savePluginConfig(nextConfig, companyId);
       setBoardSnapshot(boardConfig);
       setBoardConfigMessage({
@@ -1131,7 +1171,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setAccessMessage(null);
     try {
       const currentConfig = await fetchPluginConfig(companyId);
-      const nextConfig = { ...currentConfig, ...accessConfig };
+      const nextConfig = serializePluginSecretRefs({ ...currentConfig, ...accessConfig });
       await savePluginConfig(nextConfig, companyId);
       setAccessSnapshot(accessConfig);
       setAccessMessage({
@@ -1155,7 +1195,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setRoutingMessage(null);
     try {
       const currentConfig = await fetchPluginConfig(companyId);
-      const nextConfig = { ...currentConfig, ...routingConfig };
+      const nextConfig = serializePluginSecretRefs({ ...currentConfig, ...routingConfig });
       await savePluginConfig(nextConfig, companyId);
       setRoutingSnapshot(routingConfig);
       setRoutingMessage({
@@ -1179,7 +1219,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setConnectionMessage(null);
     try {
       const currentConfig = await fetchPluginConfig(companyId);
-      const nextConfig = { ...currentConfig, ...connectionConfig };
+      const nextConfig = serializePluginSecretRefs({ ...currentConfig, ...connectionConfig });
       await savePluginConfig(nextConfig, companyId);
       setConnectionSnapshot(connectionConfig);
       setConnectionMessage({
@@ -1291,7 +1331,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
 
   async function mergeCurrentUnsavedConfig(): Promise<Record<string, unknown>> {
     const saved = await fetchPluginConfig(companyId);
-    return {
+    return serializePluginSecretRefs({
       ...saved,
       ...connectionConfig,
       ...accessConfig,
@@ -1300,7 +1340,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
       ...routingConfig,
       ...escalationConfig,
       ...proactiveConfig,
-    };
+    });
   }
 
   async function handleSaveMediaConfig(): Promise<void> {
@@ -1308,7 +1348,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setMediaMessage(null);
     try {
       const currentConfig = await fetchPluginConfig(companyId);
-      const nextConfig = { ...currentConfig, ...mediaConfig };
+      const nextConfig = serializePluginSecretRefs({ ...currentConfig, ...mediaConfig });
       await savePluginConfig(nextConfig, companyId);
       setMediaSnapshot(mediaConfig);
       setMediaMessage({
@@ -1332,7 +1372,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setEscalationMessage(null);
     try {
       const currentConfig = await fetchPluginConfig(companyId);
-      const nextConfig = { ...currentConfig, ...escalationConfig };
+      const nextConfig = serializePluginSecretRefs({ ...currentConfig, ...escalationConfig });
       await savePluginConfig(nextConfig, companyId);
       setEscalationSnapshot(escalationConfig);
       setEscalationMessage({
@@ -1356,7 +1396,7 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     setProactiveMessage(null);
     try {
       const currentConfig = await fetchPluginConfig(companyId);
-      const nextConfig = { ...currentConfig, ...proactiveConfig };
+      const nextConfig = serializePluginSecretRefs({ ...currentConfig, ...proactiveConfig });
       await savePluginConfig(nextConfig, companyId);
       setProactiveSnapshot(proactiveConfig);
       setProactiveMessage({
@@ -1842,16 +1882,16 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
 
         <div style={{ display: "flex", gap: 10, justifyContent: "flex-start" }}>
           <button
-            disabled={!companyId || testConfigRunning}
+            disabled={!companyId || testConfigRunning || anySectionLoading}
             onClick={() => {
               void handleRunTestConfig();
             }}
             style={{
-              background: !companyId || testConfigRunning ? "#9ca3af" : "#111827",
+              background: !companyId || testConfigRunning || anySectionLoading ? "#9ca3af" : "#111827",
               border: 0,
               borderRadius: 8,
               color: "white",
-              cursor: !companyId || testConfigRunning ? "not-allowed" : "pointer",
+              cursor: !companyId || testConfigRunning || anySectionLoading ? "not-allowed" : "pointer",
               fontWeight: 700,
               minWidth: 180,
               padding: "10px 14px",
@@ -1880,8 +1920,8 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
             }}
           >
             <strong>{testConfigReport.title}</strong>
-            {testConfigReport.lines.map((line) => (
-              <span key={line} style={{ fontSize: 13 }}>
+            {testConfigReport.lines.map((line, index) => (
+              <span key={index} style={{ fontSize: 13 }}>
                 {line}
               </span>
             ))}

@@ -386,7 +386,7 @@ async function runTestConfigAction(
 
   const baseUrlInput =
     asNonEmptyString(record.paperclipBaseUrl) ?? String(DEFAULT_CONFIG.paperclipBaseUrl);
-  const paperclipProbe = await probePaperclipHost(baseUrlInput, ctx.http.fetch);
+  const paperclipProbe = await probePaperclipHost(baseUrlInput, ctx.http.fetch.bind(ctx.http));
   if (!paperclipProbe.ok) {
     return {
       ok: false,
