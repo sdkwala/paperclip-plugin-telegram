@@ -120,6 +120,28 @@ type PluginConfigResponse = {
   configJson?: Record<string, unknown> | null;
 } | null;
 
+type TestConfigActionResult = {
+  ok: boolean;
+  stage: "secret" | "telegram" | "paperclip" | "complete";
+  error?: string;
+  bot?: { id: number; username?: string; firstName?: string };
+  chats?: Array<{ chatId: string; ok: boolean; error?: string }>;
+  paperclip?: { ok: boolean; status?: string; version?: string; error?: string };
+  checkedAt?: string;
+};
+
+type PluginConfigTestResponse = {
+  valid?: boolean;
+  message?: string;
+  supported?: boolean;
+} | null;
+
+type TestConfigReport = {
+  tone: "success" | "error";
+  title: string;
+  lines: string[];
+};
+
 const TELEGRAM_PLUGIN_ID = "paperclip-plugin-telegram";
 
 const DEFAULT_ROUTING_CONFIG: TelegramRoutingConfig = {
@@ -133,10 +155,13 @@ const DEFAULT_ROUTING_CONFIG: TelegramRoutingConfig = {
   approvalsChatId: "",
   approvalsTopicId: "",
   notifyOnApprovalCreated: true,
-  onlyNotifyBoardApprovals: false,
+  // M1 default: only true board gates ring a phone; internal approval chains
+  // stay inside Paperclip.
+  onlyNotifyBoardApprovals: true,
   errorsChatId: "",
   errorsTopicId: "",
   notifyOnAgentError: true,
+  // M1 defaults: agent-run start/finish lifecycle notifications stay off.
   notifyOnAgentRunStarted: false,
   notifyOnAgentRunFinished: false,
   digestChatId: "",
@@ -149,7 +174,10 @@ const DEFAULT_ROUTING_CONFIG: TelegramRoutingConfig = {
 
 const DEFAULT_CONNECTION_CONFIG: TelegramConnectionConfig = {
   telegramBotTokenRef: "",
-  paperclipBaseUrl: "http://localhost:3100",
+  // Deployment-specific default: resolved from the browser origin when the
+  // page loads (see extractConnectionConfig). A hardcoded localhost default
+  // is a footgun outside single-machine deployments.
+  paperclipBaseUrl: "",
   paperclipPublicUrl: "",
 };
 
@@ -157,9 +185,12 @@ const DEFAULT_BOARD_CONFIG: TelegramBoardConfig = {
   paperclipBoardApiTokenRef: "",
 };
 
+// M1 defaults: commands/inbound start disabled and cannot be enabled until at
+// least one Telegram allowlist entry exists — the host config policy refuses
+// empty-allowlist configs while either is on.
 const DEFAULT_ACCESS_CONFIG: TelegramAccessConfig = {
-  enableCommands: true,
-  enableInbound: true,
+  enableCommands: false,
+  enableInbound: false,
   allowedTelegramUserIds: [],
   allowedTelegramChatIds: [],
 };
@@ -293,7 +324,10 @@ function extractRoutingConfig(config: Record<string, unknown>): TelegramRoutingC
 function extractConnectionConfig(config: Record<string, unknown>): TelegramConnectionConfig {
   return {
     telegramBotTokenRef: asString(config.telegramBotTokenRef),
-    paperclipBaseUrl: asString(config.paperclipBaseUrl) || DEFAULT_CONNECTION_CONFIG.paperclipBaseUrl,
+    // Deployment-specific default: the same origin this Paperclip browser
+    // session is served from, instead of a hardcoded localhost URL.
+    paperclipBaseUrl:
+      asString(config.paperclipBaseUrl) || resolveBrowserOrigin() || DEFAULT_CONNECTION_CONFIG.paperclipBaseUrl,
     paperclipPublicUrl: asString(config.paperclipPublicUrl),
   };
 }
@@ -424,6 +458,41 @@ function buildPaperclipUrl(input: string): string | null {
   } catch {
     return null;
   }
+}
+
+function parseHttpUrlOrigin(value: string): URL | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function isLocalhostHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!normalized) return false;
+  if (normalized === "localhost" || normalized.endsWith(".localhost")) return true;
+  if (normalized === "::1" || normalized === "0.0.0.0") return true;
+  return /^127(\.\d{1,3}){3}$/.test(normalized);
+}
+
+function isLocalhostUrl(value: string): boolean {
+  const parsed = parseHttpUrlOrigin(value);
+  return parsed !== null && isLocalhostHostname(parsed.hostname);
+}
+
+function uniqueChatIds(values: string[]): string[] {
+  const seen = new Set<string>();
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (trimmed) seen.add(trimmed);
+  }
+  return [...seen];
 }
 
 function resolveCliAuthUrl(url?: string, path?: string): string | null {
@@ -660,10 +729,22 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
   const [proactiveLoading, setProactiveLoading] = useState(true);
   const [proactiveSaving, setProactiveSaving] = useState(false);
   const [proactiveMessage, setProactiveMessage] = useState<Notice | null>(null);
+  const [testConfigRunning, setTestConfigRunning] = useState(false);
+  const [testConfigReport, setTestConfigReport] = useState<TestConfigReport | null>(null);
+  // Set only after a passing Test configuration; origin overrides cannot be
+  // saved until this check covers the current override values.
+  const [connectionValidated, setConnectionValidated] = useState<{
+    telegramBotTokenRef: string;
+    paperclipBaseUrl: string;
+    paperclipPublicUrl: string;
+  } | null>(null);
+  const testConfigAction = usePluginAction("test-config");
   const companyId = context.companyId ?? "";
   const companyLabel = context.companyPrefix?.trim() || "this company";
   const configured = Boolean(boardAccess.data?.configured);
   const identity = boardAccess.data?.identity?.trim() || null;
+  const boardAccessSecretRef = boardAccess.data?.paperclipBoardApiTokenRef?.trim() || null;
+  const boardAccessUpdatedAt = boardAccess.data?.updatedAt?.trim() || null;
   const routingDirty = JSON.stringify(routingConfig) !== JSON.stringify(routingSnapshot);
   const connectionDirty = JSON.stringify(connectionConfig) !== JSON.stringify(connectionSnapshot);
   const boardConfigDirty = JSON.stringify(boardConfig) !== JSON.stringify(boardSnapshot);
@@ -671,6 +752,53 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
   const mediaDirty = JSON.stringify(mediaConfig) !== JSON.stringify(mediaSnapshot);
   const escalationDirty = JSON.stringify(escalationConfig) !== JSON.stringify(escalationSnapshot);
   const proactiveDirty = JSON.stringify(proactiveConfig) !== JSON.stringify(proactiveSnapshot);
+
+  // --- Paperclip origin guard (PUP-89 M1 §5) ---
+  const detectedOrigin = resolveBrowserOrigin();
+  const baseUrlOrigin = parseHttpUrlOrigin(connectionConfig.paperclipBaseUrl);
+  const publicUrlOrigin = parseHttpUrlOrigin(connectionConfig.paperclipPublicUrl);
+  const resolvedOrigin = publicUrlOrigin ?? baseUrlOrigin;
+  const resolvedOriginLabel = resolvedOrigin?.origin ?? null;
+  const resolvedOriginSource = publicUrlOrigin
+    ? "Paperclip public URL"
+    : baseUrlOrigin
+      ? "Paperclip API URL"
+      : null;
+  const originInvalidWarning =
+    (!baseUrlOrigin && connectionConfig.paperclipBaseUrl.trim().length > 0
+      ? "Paperclip API URL is not a valid http(s) URL."
+      : "") ||
+    (publicUrlOrigin === null && connectionConfig.paperclipPublicUrl.trim().length > 0
+      ? "Paperclip public URL is not a valid http(s) URL."
+      : "");
+  const originLocalhostFlag = isLocalhostUrl(connectionConfig.paperclipBaseUrl)
+    ? "Paperclip API URL"
+    : isLocalhostUrl(connectionConfig.paperclipPublicUrl)
+      ? "Paperclip public URL"
+      : null;
+  const originMismatchBlock =
+    baseUrlOrigin !== null &&
+    isLocalhostHostname(baseUrlOrigin.hostname) &&
+    detectedOrigin !== null &&
+    !isLocalhostHostname(new URL(detectedOrigin).hostname);
+  const originOverride =
+    connectionConfig.paperclipBaseUrl.trim() !== (connectionSnapshot.paperclipBaseUrl.trim() || (detectedOrigin ?? "")) ||
+    connectionConfig.paperclipPublicUrl.trim() !==
+      (connectionSnapshot.paperclipPublicUrl.trim() || (detectedOrigin ?? ""));
+  const originOverrideNeedsTest =
+    originOverride && connectionConfig.telegramBotTokenRef.trim().length > 0;
+  const originOverrideValidated =
+    !originOverrideNeedsTest ||
+    (connectionValidated !== null &&
+      connectionValidated.telegramBotTokenRef === connectionConfig.telegramBotTokenRef &&
+      connectionValidated.paperclipBaseUrl === connectionConfig.paperclipBaseUrl &&
+      connectionValidated.paperclipPublicUrl === connectionConfig.paperclipPublicUrl);
+
+  // --- Allowlist guardrail (PUP-89 M1 §6) ---
+  const inboundActive = accessConfig.enableCommands || accessConfig.enableInbound;
+  const allowlistsEmpty =
+    accessConfig.allowedTelegramUserIds.length === 0 && accessConfig.allowedTelegramChatIds.length === 0;
+  const accessAllowlistBlock = inboundActive && allowlistsEmpty;
 
   useEffect(() => {
     let cancelled = false;
@@ -991,6 +1119,14 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
   }
 
   async function handleSaveAccessConfig(): Promise<void> {
+    if (accessAllowlistBlock) {
+      setAccessMessage({
+        tone: "error",
+        title: "Allowlist required before inbound commands are live",
+        text: "Add at least one allowed Telegram user or chat ID, or turn bot commands and inbound replies off.",
+      });
+      return;
+    }
     setAccessSaving(true);
     setAccessMessage(null);
     try {
@@ -1060,6 +1196,111 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     } finally {
       setConnectionSaving(false);
     }
+  }
+
+  async function handleRunTestConfig(): Promise<void> {
+    if (!companyId) {
+      setTestConfigReport({
+        tone: "error",
+        title: "Test configuration needs a company context",
+        lines: ["Open this settings page inside a company, then run it again."],
+      });
+      return;
+    }
+
+    setTestConfigRunning(true);
+    setTestConfigReport(null);
+    try {
+      const candidate = await mergeCurrentUnsavedConfig();
+      const validation = await fetchHostJson<PluginConfigTestResponse>(
+        `/api/plugins/${encodeURIComponent(TELEGRAM_PLUGIN_ID)}/config/test`,
+        {
+          method: "POST",
+          body: JSON.stringify({ companyId, configJson: candidate }),
+        },
+      );
+
+      if (validation && validation.valid === false) {
+        setTestConfigReport({
+          tone: "error",
+          title: "Configuration validation failed",
+          lines: [validation.message?.trim() || "The Paperclip host or plugin rejected the current settings."],
+        });
+        return;
+      }
+
+      const actionResult = (await testConfigAction({
+        companyId,
+        telegramBotTokenRef: connectionConfig.telegramBotTokenRef,
+        paperclipBaseUrl: connectionConfig.paperclipBaseUrl,
+        probeChatIds: uniqueChatIds([
+          routingConfig.defaultChatId,
+          routingConfig.approvalsChatId,
+          routingConfig.errorsChatId,
+          escalationConfig.escalationChatId,
+        ]),
+      })) as TestConfigActionResult | null;
+
+      if (!actionResult || actionResult.ok !== true) {
+        setTestConfigReport({
+          tone: "error",
+          title: "Test configuration found a problem",
+          lines: [actionResult?.error ?? "The plugin worker could not complete the test."],
+        });
+        return;
+      }
+
+      const lines: string[] = [];
+      const bot = actionResult.bot;
+      if (bot) {
+        lines.push(
+          bot.username
+            ? `Bot identity: @${bot.username} (Bot ID ${bot.id})`
+            : `Bot identity: Bot ID ${bot.id}`,
+        );
+      }
+      if (actionResult.paperclip?.ok) {
+        const version = actionResult.paperclip.version ? ` · v${actionResult.paperclip.version}` : "";
+        lines.push(`Paperclip host: ${connectionConfig.paperclipBaseUrl.trim()} — ${actionResult.paperclip.status ?? "reachable"}${version}`);
+      }
+      for (const chat of actionResult.chats ?? []) {
+        lines.push(chat.ok ? `Chat ${chat.chatId}: reachable` : `Chat ${chat.chatId}: ${chat.error ?? "not reachable"}`);
+      }
+
+      setConnectionValidated({
+        telegramBotTokenRef: connectionConfig.telegramBotTokenRef,
+        paperclipBaseUrl: connectionConfig.paperclipBaseUrl,
+        paperclipPublicUrl: connectionConfig.paperclipPublicUrl,
+      });
+
+      setTestConfigReport({
+        tone: "success",
+        title: "Configuration test passed",
+        lines: lines,
+      });
+    } catch (error) {
+      setTestConfigReport({
+        tone: "error",
+        title: "Test configuration failed",
+        lines: [getErrorMessage(error)],
+      });
+    } finally {
+      setTestConfigRunning(false);
+    }
+  }
+
+  async function mergeCurrentUnsavedConfig(): Promise<Record<string, unknown>> {
+    const saved = await fetchPluginConfig(companyId);
+    return {
+      ...saved,
+      ...connectionConfig,
+      ...accessConfig,
+      ...boardConfig,
+      ...mediaConfig,
+      ...routingConfig,
+      ...escalationConfig,
+      ...proactiveConfig,
+    };
   }
 
   async function handleSaveMediaConfig(): Promise<void> {
@@ -1242,6 +1483,87 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
           </p>
         </div>
 
+        <div
+          style={{
+            background: "#f9fafb",
+            border: "1px solid #e5e7eb",
+            borderRadius: 8,
+            display: "grid",
+            gap: 8,
+            padding: 12,
+          }}
+        >
+          <div style={{ alignItems: "center", display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "space-between" }}>
+            <strong style={{ color: "#374151", fontSize: 13 }}>Resolved Paperclip origin</strong>
+            <span style={{ alignItems: "center", display: "flex", flexWrap: "wrap", gap: 8 }}>
+              <code style={{ fontSize: 13 }}>
+                {resolvedOriginLabel ?? "Not configured"}
+              </code>
+              {resolvedOriginSource && resolvedOriginLabel ? (
+                <span style={{ color: "#6b7280", fontSize: 12 }}>({resolvedOriginSource})</span>
+              ) : null}
+              {originLocalhostFlag ? (
+                <span
+                  style={{
+                    background: "#fef3c7",
+                    border: "1px solid #fcd34d",
+                    borderRadius: 999,
+                    color: "#92400e",
+                    fontSize: 11,
+                    fontWeight: 700,
+                    padding: "3px 8px",
+                  }}
+                >
+                  localhost — {originLocalhostFlag}
+                </span>
+              ) : null}
+            </span>
+          </div>
+          {originLocalhostFlag ? (
+            <span style={{ color: "#92400e", fontSize: 12 }}>
+              localhost is only reachable from the same machine as Paperclip. Approval buttons and notification links sent to remote Telegram chats will fail with a localhost origin.
+            </span>
+          ) : null}
+          {originMismatchBlock ? (
+            <span style={{ color: "#991b1b", fontSize: 12 }}>
+              Save blocked: the Paperclip origin is localhost but this browser is not on localhost. Set the real deployment origin below.
+            </span>
+          ) : null}
+          {originInvalidWarning ? (
+            <span style={{ color: "#991b1b", fontSize: 12 }}>{originInvalidWarning}</span>
+          ) : null}
+          <div style={{ alignItems: "center", display: "flex", gap: 10, justifyContent: "space-between" }}>
+            <span style={{ color: "#6b7280", fontSize: 12 }}>
+              {detectedOrigin
+                ? `Detected in this browser: ${detectedOrigin}`
+                : "Origin detection unavailable in this browser context."}
+            </span>
+            <button
+              disabled={
+                connectionLoading ||
+                connectionSaving ||
+                !detectedOrigin ||
+                connectionConfig.paperclipBaseUrl.trim() === (detectedOrigin as string)
+              }
+              onClick={() => updateConnectionField("paperclipBaseUrl", detectedOrigin as string)}
+              style={{
+                background: "white",
+                border: "1px solid #d1d5db",
+                borderRadius: 8,
+                color: "#374151",
+                cursor:
+                  connectionLoading || connectionSaving || !detectedOrigin ? "not-allowed" : "pointer",
+                fontSize: 12,
+                fontWeight: 700,
+                padding: "7px 10px",
+              }}
+              type="button"
+            >
+              Use detected origin
+            </button>
+          </div>
+        </div>
+
         <div style={{ display: "grid", gap: 12 }}>
           <SecretRefField
             companyId={companyId}
@@ -1255,23 +1577,29 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
           </SecretRefField>
           <TextField
             disabled={connectionLoading || connectionSaving}
-            label="Paperclip API URL"
+            label="Paperclip API URL (override)"
             onChange={(value) => updateConnectionField("paperclipBaseUrl", value)}
-            placeholder="http://localhost:3100"
+            placeholder={detectedOrigin ?? "https://paperclip.example.com"}
             value={connectionConfig.paperclipBaseUrl}
           >
-            Internal Paperclip API URL used by the plugin for actions such as approvals and comments. Keep localhost for same-server deployments.
+            Internal Paperclip API URL used by the plugin for actions such as approvals and comments. Defaults to the detected origin; overriding is gated by Test configuration below.
           </TextField>
           <TextField
             disabled={connectionLoading || connectionSaving}
-            label="Paperclip public URL"
+            label="Paperclip public URL (override)"
             onChange={(value) => updateConnectionField("paperclipPublicUrl", value)}
             placeholder="https://paperclip.example.com"
             value={connectionConfig.paperclipPublicUrl}
           >
-            Public URL used in Telegram links. Leave empty to fall back to the API URL.
+            Public URL used in Telegram links. Leave empty to fall back to the API URL. localhost flags below but does not block — only links to this origin are affected.
           </TextField>
         </div>
+
+        {originOverrideNeedsTest ? (
+          <span style={{ color: "#92400e", fontSize: 12 }}>
+            Origin override set — run Test configuration to validate it before saving.
+          </span>
+        ) : null}
 
         {connectionMessage ? <NoticeBlock notice={connectionMessage} /> : null}
 
@@ -1296,16 +1624,39 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
             Reset
           </button>
           <button
-            disabled={connectionLoading || connectionSaving || !connectionDirty}
+            disabled={
+              connectionLoading ||
+              connectionSaving ||
+              !connectionDirty ||
+              Boolean(originInvalidWarning) ||
+              Boolean(originMismatchBlock) ||
+              !originOverrideValidated
+            }
             onClick={() => {
               void handleSaveConnectionConfig();
             }}
             style={{
-              background: connectionLoading || connectionSaving || !connectionDirty ? "#9ca3af" : "#111827",
+              background:
+                connectionLoading ||
+                connectionSaving ||
+                !connectionDirty ||
+                Boolean(originInvalidWarning) ||
+                Boolean(originMismatchBlock) ||
+                !originOverrideValidated
+                  ? "#9ca3af"
+                  : "#111827",
               border: 0,
               borderRadius: 8,
               color: "white",
-              cursor: connectionLoading || connectionSaving || !connectionDirty ? "not-allowed" : "pointer",
+              cursor:
+                connectionLoading ||
+                connectionSaving ||
+                !connectionDirty ||
+                Boolean(originInvalidWarning) ||
+                Boolean(originMismatchBlock) ||
+                !originOverrideValidated
+                  ? "not-allowed"
+                  : "pointer",
               fontWeight: 700,
               minWidth: 160,
               padding: "10px 14px",
@@ -1375,6 +1726,19 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
                 ? "The board token is stored as a Paperclip secret; the plugin keeps only the secret reference."
                 : "This opens a Paperclip approval page, then saves the resulting board token as a company secret."}
             </span>
+            {boardAccessSecretRef || boardAccessUpdatedAt ? (
+              <span style={{ color: "#6b7280", fontSize: 12 }}>
+                {boardAccessSecretRef ? (
+                  <>
+                    {"Secret UUID: "}
+                    <code style={{ color: "#111827", fontSize: 12 }}>{boardAccessSecretRef}</code>
+                    {" — read-only; rotate by reconnecting."}
+                  </>
+                ) : null}
+                {boardAccessSecretRef && boardAccessUpdatedAt ? " · " : null}
+                {boardAccessUpdatedAt ? `Connected ${boardAccessUpdatedAt.slice(0, 16).replace("T", " ")} UTC.` : null}
+              </span>
+            ) : null}
           </div>
           <button
             disabled={!companyId || connecting || boardAccess.loading}
@@ -1470,20 +1834,99 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
         }}
       >
         <div style={{ display: "grid", gap: 4 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 700, lineHeight: "28px", margin: 0 }}>Test configuration</h2>
+          <p style={{ color: "#6b7280", margin: 0 }}>
+            Validates the current (unsaved) settings with the Paperclip host, then resolves the bot token secret, verifies bot identity with Telegram getMe, probes chat reachability, and checks the Paperclip API origin.
+          </p>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-start" }}>
+          <button
+            disabled={!companyId || testConfigRunning}
+            onClick={() => {
+              void handleRunTestConfig();
+            }}
+            style={{
+              background: !companyId || testConfigRunning ? "#9ca3af" : "#111827",
+              border: 0,
+              borderRadius: 8,
+              color: "white",
+              cursor: !companyId || testConfigRunning ? "not-allowed" : "pointer",
+              fontWeight: 700,
+              minWidth: 180,
+              padding: "10px 14px",
+            }}
+            type="button"
+          >
+            {testConfigRunning ? "Testing..." : "Test configuration"}
+          </button>
+          <span style={helperTextStyle}>
+            {!companyId
+              ? "Open this settings page inside a company to test."
+              : "This also unlocks saving a Paperclip origin override once it passes."}
+          </span>
+        </div>
+
+        {testConfigReport ? (
+          <div
+            style={{
+              border: `1px solid ${testConfigReport.tone === "success" ? "#99f6e4" : "#fecaca"}`,
+              borderRadius: 8,
+              background: testConfigReport.tone === "success" ? "#f0fdfa" : "#fef2f2",
+              color: testConfigReport.tone === "success" ? "#115e59" : "#991b1b",
+              display: "grid",
+              gap: 4,
+              padding: 12,
+            }}
+          >
+            <strong>{testConfigReport.title}</strong>
+            {testConfigReport.lines.map((line) => (
+              <span key={line} style={{ fontSize: 13 }}>
+                {line}
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </section>
+
+      <section
+        style={{
+          border: "1px solid #e5e7eb",
+          borderRadius: 8,
+          display: "grid",
+          gap: 18,
+          padding: 18,
+        }}
+      >
+        <div style={{ display: "grid", gap: 4 }}>
           <h2 style={{ fontSize: 18, fontWeight: 700, lineHeight: "28px", margin: 0 }}>Bot Interaction & Access Control</h2>
           <p style={{ color: "#6b7280", margin: 0 }}>
-            Controls who can use the bot interactively. Empty allowlists are permissive; set both user and chat IDs for strict private-group access.
+            Controls who can use the bot interactively. Commands and inbound replies refuse to enable while both allowlists are empty.
           </p>
         </div>
 
         <div style={{ display: "grid", gap: 12 }}>
+          {accessAllowlistBlock ? (
+            <div
+              style={{
+                background: "#fef3c7",
+                border: "1px solid #fcd34d",
+                borderRadius: 8,
+                color: "#92400e",
+                fontSize: 13,
+                padding: "9px 10px",
+              }}
+            >
+              Allowlist required before inbound commands are live. Save is disabled until at least one user or chat ID is allowed.
+            </div>
+          ) : null}
           <CheckboxField
             checked={accessConfig.enableCommands}
             disabled={accessLoading || accessSaving}
             label="Enable bot commands"
             onChange={(value) => updateAccessField("enableCommands", value)}
           >
-            Allow Telegram users to run commands such as /status, /issues, and /agents. Use allowlists when commands are enabled.
+            Allow Telegram users to run commands such as /status, /issues, and /agents. Requires a non-empty allowlist.
           </CheckboxField>
           <CheckboxField
             checked={accessConfig.enableInbound}
@@ -1491,29 +1934,29 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
             label="Enable inbound replies"
             onChange={(value) => updateAccessField("enableInbound", value)}
           >
-            Route Telegram replies to Paperclip issue comments when a message replies to a bot notification. Use allowlists when inbound replies are enabled.
+            Route Telegram replies to Paperclip issue comments when a message replies to a bot notification. Requires a non-empty allowlist.
           </CheckboxField>
           <ArrayField
             disabled={accessLoading || accessSaving}
-            emptyValueLabel="No user IDs configured"
+            emptyValueLabel="No user IDs configured — the allowlist gate stays closed"
             label="Allowed Telegram user IDs"
             newItemLabel="Add user ID"
             onChange={(value) => updateAccessField("allowedTelegramUserIds", value)}
             placeholder="6395513943"
             value={accessConfig.allowedTelegramUserIds}
           >
-            Optional. One Telegram user ID per line. Leave empty to allow any user. Applies to commands, inbound replies, media intake, and button callbacks.
+            Required before commands or inbound replies can be enabled. One Telegram user ID per line. Applies to commands, inbound replies, media intake, and button callbacks.
           </ArrayField>
           <ArrayField
             disabled={accessLoading || accessSaving}
-            emptyValueLabel="No chat IDs configured"
+            emptyValueLabel="No chat IDs configured — the allowlist gate stays closed"
             label="Allowed Telegram chat IDs"
             newItemLabel="Add chat ID"
             onChange={(value) => updateAccessField("allowedTelegramChatIds", value)}
             placeholder="-1003800613668"
             value={accessConfig.allowedTelegramChatIds}
           >
-            Optional. One chat ID per line. Use private DM IDs and/or private group IDs. If both user and chat allowlists are set, both must match.
+            Required before commands or inbound replies can be enabled. One chat ID per line: private DM IDs and/or private group IDs. If both user and chat allowlists are set, both must match.
           </ArrayField>
         </div>
 
@@ -1540,16 +1983,16 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
             Reset
           </button>
           <button
-            disabled={accessLoading || accessSaving || !accessDirty}
+            disabled={accessLoading || accessSaving || !accessDirty || accessAllowlistBlock}
             onClick={() => {
               void handleSaveAccessConfig();
             }}
             style={{
-              background: accessLoading || accessSaving || !accessDirty ? "#9ca3af" : "#111827",
+              background: accessLoading || accessSaving || !accessDirty || accessAllowlistBlock ? "#9ca3af" : "#111827",
               border: 0,
               borderRadius: 8,
               color: "white",
-              cursor: accessLoading || accessSaving || !accessDirty ? "not-allowed" : "pointer",
+              cursor: accessLoading || accessSaving || !accessDirty || accessAllowlistBlock ? "not-allowed" : "pointer",
               fontWeight: 700,
               minWidth: 160,
               padding: "10px 14px",
