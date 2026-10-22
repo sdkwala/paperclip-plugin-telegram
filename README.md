@@ -194,8 +194,8 @@ Before filing a bug, confirm which Paperclip host this plugin is actually talkin
 | `notifyOnAgentError` | No | Send agent failure notifications (default: true) |
 | `notifyOnAgentRunStarted` | No | Send agent run-start lifecycle notifications (default: false) |
 | `notifyOnAgentRunFinished` | No | Send agent run-finish lifecycle notifications (default: false) |
-| `allowedTelegramUserIds` | No | Optional allowlist of Telegram user IDs allowed to use commands, inbound replies, media intake, and inline buttons. Empty means any user is allowed |
-| `allowedTelegramChatIds` | No | Optional allowlist of Telegram chat IDs where commands, inbound replies, media intake, and inline buttons are accepted. Empty means any chat is allowed |
+| `allowedTelegramUserIds` | No | Optional allowlist of Telegram user IDs allowed to use commands, inbound replies, media intake, and inline buttons. Required (non-empty) when `enableCommands` or `enableInbound` is enabled |
+| `allowedTelegramChatIds` | No | Optional allowlist of Telegram chat IDs where commands, inbound replies, media intake, and inline buttons are accepted. Required (non-empty) when `enableCommands` or `enableInbound` is enabled |
 | `topicRouting` | No | Map forum topics to projects (default: false) |
 | `digestMode` | No | Digest frequency: off, daily, bidaily, tridaily (default: off) |
 | `dailyDigestTime` | No | UTC time for digest, HH:MM (default: 09:00) |
@@ -227,7 +227,7 @@ The allowlists apply to:
 - media intake
 - inline button callbacks
 
-Leave an allowlist empty only if that dimension should be unrestricted. After changing allowlists, save the plugin settings and restart the plugin if the new values are not picked up immediately.
+At least one of the two allowlists must contain an entry when `enableCommands` or `enableInbound` is enabled. An empty allowlist leaves that dimension unrestricted, so with both empty the bot accepts commands and replies from anyone who can reach it; configuration validation rejects that combination. Leave an allowlist empty only if that dimension should be unrestricted and the other one is configured. After changing allowlists, save the plugin settings and restart the plugin if the new values are not picked up immediately.
 
 ### Board access for approval actions
 
