@@ -56,7 +56,7 @@ import { EscalationManager } from "./escalation.js";
 import type { EscalationEvent } from "./escalation.js";
 import { isTelegramUpdateAllowed, validateTelegramAllowlists } from "./allowlist.js";
 import { normalizeSecretRef, validateSecretRefFields } from "./secret-ref-validation.js";
-import { parseHttpOrigin, validateTelegramOriginUrls } from "./origin-guard.js";
+import { isLocalhostHostname, parseHttpOrigin, validateTelegramOriginUrls } from "./origin-guard.js";
 import { shouldNotifyApproval } from "./approval-routing.js";
 import { isWorking } from "./agent-status.js";
 import { buildPaperclipAuthHeaders, fetchPaperclipApi } from "./paperclip-api.js";
@@ -280,7 +280,7 @@ async function probePaperclipHost(
 
   try {
     const url = `${parsed.origin}/api/health`;
-    const response = isLoopbackHostname(parsed.hostname)
+    const response = isLocalhostHostname(parsed.hostname)
       ? await fetch(url, { method: "GET" })
       : await governedFetch(url, { method: "GET" });
 
@@ -311,10 +311,6 @@ async function probePaperclipHost(
       error: `Paperclip API URL ${parsed.origin} did not respond: ${detail}. Verify the host before saving — approval buttons and links break with the wrong origin.`,
     };
   }
-}
-
-function isLoopbackHostname(hostname: string): boolean {
-  return ["localhost", "127.0.0.1", "[::1]", "0.0.0.0"].includes(hostname);
 }
 
 async function runTestConfigAction(

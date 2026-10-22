@@ -814,9 +814,8 @@ export function TelegramSettingsPage({ context }: PluginSettingsPageProps): Reac
     detectedOrigin !== null &&
     !isLocalhostHostname(new URL(detectedOrigin).hostname);
   const originOverride =
-    connectionConfig.paperclipBaseUrl.trim() !== (connectionSnapshot.paperclipBaseUrl.trim() || (detectedOrigin ?? "")) ||
-    connectionConfig.paperclipPublicUrl.trim() !==
-      (connectionSnapshot.paperclipPublicUrl.trim() || (detectedOrigin ?? ""));
+    connectionConfig.paperclipBaseUrl.trim() !== connectionSnapshot.paperclipBaseUrl.trim() ||
+    connectionConfig.paperclipPublicUrl.trim() !== connectionSnapshot.paperclipPublicUrl.trim();
   const originOverrideNeedsTest =
     originOverride && connectionConfig.telegramBotTokenRef.trim().length > 0;
   const originOverrideValidated =
